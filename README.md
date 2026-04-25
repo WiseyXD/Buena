@@ -21,9 +21,10 @@
    docker compose up -d
    ```
 
-4. **Seed the demo dataset** (applies schema, inserts 4 properties with 6 months of history)
+4. **Seed the demo dataset and apply migrations** (inserts properties and creates all required tables)
    ```bash
    python -m seed.seed
+   python -c "from connectors.migrations import apply_all; apply_all()"
    ```
 
 5. **Run the backend**
