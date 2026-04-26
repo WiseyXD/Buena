@@ -72,11 +72,15 @@ _cors_origins = [
 _cors_origins.extend([
     "https://keystone-insight.lovable.app",
     "https://preview--keystone-insight.lovable.app",
+    "https://keystone-insight.lovable.app",
+    "https://preview--keystone-insight.lovable.app",
+    "https://e014e01e-3cc6-4aff-8939-c1bc4f248e09.lovableproject.com",
 ])
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
+    allow_origin_regex=r"https://.*\.(lovable\.app|lovableproject\.com)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
