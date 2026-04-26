@@ -383,7 +383,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"- exhausted: {state.exhausted}\n"
             )
         if args.out:
-            out_path = Path(args.out)
+            out_path = Path(args.out).resolve()
+            if not out_path.is_relative_to(Path.cwd()):
+                raise ValueError("Output path must be within the current directory.")
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(markdown, encoding="utf-8")
             log.info("eval.report.written", path=str(out_path))

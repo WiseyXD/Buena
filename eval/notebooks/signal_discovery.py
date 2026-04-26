@@ -364,7 +364,9 @@ def main(argv: list[str] | None = None) -> int:
 
     markdown = asyncio.run(_execute_all())
     if args.out:
-        path = Path(args.out)
+        path = Path(args.out).resolve()
+        if not path.is_relative_to(Path.cwd()):
+            raise ValueError("Output path must be within the current directory.")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(markdown, encoding="utf-8")
         log.info("signal_discovery.written", path=str(path))

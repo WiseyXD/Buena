@@ -88,7 +88,8 @@ async def _write_or_supersede_fact(
         )
         scope_id = building_id
     else:
-        assert liegenschaft_id is not None
+        if liegenschaft_id is None:
+            raise ValueError("liegenschaft_id must not be None")
         scope_clause = (
             "liegenschaft_id = :scope_id "
             "AND property_id IS NULL AND building_id IS NULL"

@@ -206,7 +206,7 @@ _BERLIN_4B_EVENTS: list[EventSeed] = [
         received_at=days_ago(178),
     ),
     EventSeed(
-        key="berlin_4b_elevator_202510",
+        key="berlin_4b_elevator_2025_10",
         source="email",
         raw_content=(
             "From: lukas.weber@tenant.demo\n"
@@ -303,7 +303,7 @@ _BERLIN_4B_FACTS: list[FactSeed] = [
     FactSeed("lease", "deposit", "EUR 3,600 held", 0.99, "berlin_4b_lease_2024"),
     FactSeed("maintenance", "elevator_noise_2025_10",
              "Elevator grinding noise reported on the top floor (non-urgent).",
-             0.85, "berlin_4b_elevator_202510"),
+             0.85, "berlin_4b_elevator_2025_10"),
     FactSeed("maintenance", "heating_issue_2025_11",
              "Cold radiators + rattling boiler — Bob's Plumbing bled radiators and reset unit.",
              0.92, "berlin_4b_heat_nov"),

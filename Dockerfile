@@ -19,6 +19,10 @@ RUN pip install --no-cache-dir -e ".[dev]"
 # Copy the rest of the application code
 COPY . .
 
+# Create a non-root user and change ownership of the application code
+RUN useradd -m appuser && chown -R appuser /app
+USER appuser
+
 # Run the seed script (applies base schema idempotently), then migrations, and start Uvicorn
 # Cloud Run sets the PORT environment variable (default 8080)
 CMD python -m seed.seed && python -c "from connectors.migrations import apply_all; apply_all()" && uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8080}
