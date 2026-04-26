@@ -47,7 +47,11 @@ SYSTEM_HINT = (
     "only the facts and events provided. Honesty over completeness — "
     "if the context doesn't support a confident answer, say so. "
     "Respond with a single JSON object that strictly matches the schema. "
-    "No prose, no markdown fences — only the JSON object."
+    "No prose, no markdown fences — only the JSON object. "
+    "Inside text fields (answer, reasoning), use plain prose only — no "
+    "markdown formatting (**, *, _, `, #), no headings, no bullet "
+    "points, no markdown links. Text will be displayed as plain text in "
+    "the UI; markdown markers leak through and look broken to the user."
 )
 
 

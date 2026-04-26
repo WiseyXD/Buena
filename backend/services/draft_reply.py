@@ -53,7 +53,11 @@ SYSTEM_HINT = (
     "(Hausverwaltung). Respond with a single JSON object that strictly "
     "matches the schema described in the user message. No prose, no "
     "markdown fences — only the JSON object. Match the language of the "
-    "inbound message in the reply body."
+    "inbound message in the reply body. Inside text fields (subject, "
+    "body, why_relevant, snippet), use plain prose only — no markdown "
+    "formatting (**, *, _, `, #), no markdown links, no bullet markers. "
+    "The reply body will be sent verbatim to a tenant or owner via "
+    "email/Slack; markdown markers look broken to the recipient."
 )
 
 
