@@ -22,6 +22,8 @@ from typing import Any
 import structlog
 
 from backend.pipeline.lexicon import (
+    COMPLAINT,
+    COMPLIANCE,
     HEATING,
     KEY_LOSS,
     LEASE,
@@ -40,6 +42,11 @@ from backend.services.gemini import (
     is_available as gemini_available,
 )
 from backend.services.lang import detect_language
+from backend.services.pioneer_llm import (
+    PioneerUnavailable,
+    extract_facts as pioneer_extract,
+    is_available as pioneer_available,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -128,6 +135,8 @@ _TOPIC_DISPATCH: dict[str, tuple[str, str, str, str]] = {
     TENANT_CHANGE.name:  ("tenant_change","medium","lease",       "termination_notice"),
     PAYMENT.name:        ("payment",     "medium", "financials",  "payment_mention"),
     OWNER_COMM.name:     ("owner_communication", "medium", "overview", "sale_intent"),
+    COMPLAINT.name:      ("maintenance", "medium", "maintenance", "noise_complaint"),
+    COMPLIANCE.name:     ("compliance",  "medium", "compliance",  "regulatory_mention"),
 }
 
 
@@ -187,12 +196,32 @@ async def extract(
     source: str,
     raw_content: str,
 ) -> ExtractionResult:
-    """Run Gemini Pro if possible; otherwise fall back to the lexicon rules.
+    """Run an LLM extractor if possible; otherwise fall back to the lexicon rules.
 
-    ``lang`` is detected from ``raw_content`` and threaded into both
-    paths so the prompt + lexicon align with the email body's language.
+    Pioneer (Claude Sonnet 4.6 via the OpenAI-compatible gateway) is the
+    primary path — Phase 11 made it the production extractor after the
+    Gemini free-tier quota became unreliable. Gemini stays as a
+    secondary so a working ``GEMINI_API_KEY`` still gets exercised. The
+    lexicon-based rule fallback is the last line of defence and never
+    talks to a remote model.
+
+    ``lang`` is detected from ``raw_content`` and threaded into every
+    path so the prompt + lexicon align with the email body's language.
     """
     lang = detect_language(raw_content)
+
+    if pioneer_available():
+        try:
+            result = await pioneer_extract(
+                property_name=property_name,
+                current_context_excerpt=current_context_excerpt,
+                source=source,
+                raw_content=raw_content,
+                lang=lang,
+            )
+            return _apply_confidence_floor(result)
+        except PioneerUnavailable as exc:
+            log.warning("extractor.pioneer_unavailable", error=str(exc), lang=lang)
 
     if gemini_available():
         try:

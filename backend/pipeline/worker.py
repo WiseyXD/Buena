@@ -31,11 +31,13 @@ from backend.pipeline.events import get_event_bus
 from backend.pipeline.extractor import extract
 from backend.pipeline.renderer import render_markdown
 from backend.pipeline.router import route
+from backend.pipeline.semantic_validator import semantic_validate
 from backend.pipeline.validator import (
     Rejection,
     persist_rejections,
     validate,
 )
+from backend.services import pioneer_llm
 
 # Importing the constraints package registers every constraint in
 # the validator's REGISTRY at module load. The validator only uses
@@ -113,6 +115,64 @@ async def _property_name(session: AsyncSession, property_id: UUID) -> str:
     return str(row.name) if row else "(unknown)"
 
 
+async def _load_event_stammdaten(
+    session: AsyncSession, property_id: UUID
+) -> dict[str, dict[str, Any]]:
+    """Pull the building + property master record for the validator.
+
+    The validator's strict-mode constraints (floor count, address,
+    year built, square meters) compare proposed values against this
+    snapshot, so an email claim that contradicts master data gets
+    rejected even when no fact row exists yet. Empty dicts are safe —
+    constraints fall back to legacy "current is None → seed" behaviour
+    when stammdaten is missing.
+    """
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT
+                    b.address    AS building_address,
+                    b.year_built AS building_year_built,
+                    b.metadata   AS building_metadata,
+                    p.metadata   AS property_metadata,
+                    p.address    AS property_address
+                FROM properties p
+                LEFT JOIN buildings b ON b.id = p.building_id
+                WHERE p.id = :pid
+                """
+            ),
+            {"pid": property_id},
+        )
+    ).first()
+    if row is None:
+        return {}
+
+    b_meta = dict(row.building_metadata or {})
+    p_meta = dict(row.property_metadata or {})
+
+    building_snap: dict[str, Any] = {}
+    if row.building_address:
+        building_snap["address"] = row.building_address
+    if row.building_year_built is not None:
+        building_snap["year_built"] = row.building_year_built
+    # Buena's loader stores floor count as ``etagen`` in
+    # buildings.metadata; the legacy seed path uses ``floors``. Read
+    # both so either ingest path works.
+    floors = b_meta.get("etagen") or b_meta.get("floors")
+    if floors is not None:
+        building_snap["floor_count"] = floors
+
+    property_snap: dict[str, Any] = {}
+    if row.property_address:
+        property_snap["address"] = row.property_address
+    qm = p_meta.get("wohnflaeche_qm") or p_meta.get("square_meters")
+    if qm is not None:
+        property_snap["square_meters"] = qm
+
+    return {"building": building_snap, "property": property_snap}
+
+
 async def _mark_processed(
     session: AsyncSession,
     event_id: UUID,
@@ -140,11 +200,75 @@ async def process_one(session: AsyncSession) -> UUID | None:
     event = await _claim_next(session)
     if event is None:
         return None
+    return await _process_event_body(session, event)
 
+
+async def _claim_specific(
+    session: AsyncSession, event_id: UUID
+) -> dict[str, Any] | None:
+    """Lock and return a specific event by id, regardless of queue position.
+
+    Used by :func:`process_specific` so the debug trigger can extract a
+    just-inserted event without draining hundreds of older items first.
+    Returns ``None`` if the event is missing or already processed.
+    """
+    result = await session.execute(
+        text(
+            """
+            SELECT id, source, source_ref, raw_content, property_id,
+                   received_at, metadata
+            FROM events
+            WHERE id = :eid
+              AND processed_at IS NULL
+              AND processing_error IS NULL
+            FOR UPDATE SKIP LOCKED
+            """
+        ),
+        {"eid": event_id},
+    )
+    row = result.first()
+    if row is None:
+        return None
+    return {
+        "id": row.id,
+        "source": row.source,
+        "source_ref": row.source_ref,
+        "raw_content": row.raw_content,
+        "property_id": row.property_id,
+        "received_at": row.received_at,
+        "metadata": dict(row.metadata or {}),
+    }
+
+
+async def process_specific(event_id: UUID) -> bool:
+    """Process one specific event end-to-end, ignoring queue order.
+
+    Returns ``True`` if the event was processed (success or graceful
+    failure marked on the row) and ``False`` if it was already done or
+    locked by another worker.
+    """
+    factory = get_sessionmaker()
+    async with factory() as session:
+        event = await _claim_specific(session, event_id)
+        if event is None:
+            return False
+        await _process_event_body(session, event)
+        return True
+
+
+async def _process_event_body(
+    session: AsyncSession, event: dict[str, Any]
+) -> UUID:
+    """Shared end-to-end pipeline for a claimed event row.
+
+    Extracted from :func:`process_one` so :func:`process_specific` can
+    reuse the same routing → extract → diff → validate → apply →
+    publish flow without copying it. Caller owns the session and must
+    have already claimed the row (``FOR UPDATE``).
+    """
     start = time.perf_counter()
     event_id: UUID = event["id"]
     property_id: UUID | None = event["property_id"]
-
     try:
         if property_id is None:
             match = await route(session, event["raw_content"])
@@ -174,25 +298,72 @@ async def process_one(session: AsyncSession) -> UUID | None:
             proposals=result.facts_to_update,
         )
 
-        # Phase 9 Step 9.2 — constraint validator. Filters proposals
-        # the differ accepted but that violate semantic rules (e.g.
-        # rent change without an addendum, building floor count
-        # change from a free-text email).
         current_facts = await load_current_facts(session, property_id)
+        stammdaten_snapshot = await _load_event_stammdaten(session, property_id)
         validated_plan, rejections = validate(
             plan,
             event={
                 "source": event["source"],
                 "metadata": event.get("metadata") or {},
+                "stammdaten": stammdaten_snapshot,
             },
             current_facts=current_facts,
         )
 
-        # Phase 9 Step 9.1 — split validator output:
-        #   * hard rejections        → rejected_updates inbox
-        #   * needs_review verdicts  → uncertainty_events inbox
-        # Both rows stay queryable; only hard rejections need an
-        # explicit operator override to ever apply.
+        # Semantic auditor — Pioneer reads the canonical property file
+        # and the new event side-by-side, surfaces every claim that
+        # contradicts what's already on file. Catches contradictions
+        # the rule-based validator wasn't pre-coded for. Failures here
+        # never block the pipeline: if Pioneer is unreachable we keep
+        # the rule-based verdict and move on.
+        try:
+            property_file_md = await render_markdown(session, property_id)
+            semantic = await semantic_validate(
+                property_file_markdown=property_file_md,
+                event_body=event["raw_content"],
+                event_source=event["source"],
+                proposed_facts=[
+                    {
+                        "section": d.section,
+                        "field": d.field,
+                        "value": d.value,
+                        "confidence": d.confidence,
+                    }
+                    for d in validated_plan.decisions
+                ],
+            )
+            if semantic.has_contradictions:
+                log.info(
+                    "worker.semantic_rejections",
+                    event_id=str(event_id),
+                    count=len(semantic.rejections),
+                )
+                rejections = list(rejections) + list(semantic.rejections)
+                # Drop validated decisions whose (section, field) the
+                # auditor flagged as a hard contradiction. Soft ones
+                # stay in the plan; the rejection ride-along is the
+                # human-review trail.
+                hard_keys = {
+                    (r.section, r.field)
+                    for r in semantic.rejections
+                    if not r.needs_review
+                }
+                if hard_keys:
+                    validated_plan = type(validated_plan)(
+                        decisions=[
+                            d
+                            for d in validated_plan.decisions
+                            if (d.section, d.field) not in hard_keys
+                        ],
+                        skipped=validated_plan.skipped,
+                    )
+        except pioneer_llm.PioneerUnavailable as exc:
+            log.warning(
+                "worker.semantic_skipped",
+                event_id=str(event_id),
+                error=str(exc)[:200],
+            )
+
         hard_rejections = [r for r in rejections if not r.needs_review]
         needs_review_uncertainties = [
             _needs_review_to_uncertainty(r) for r in rejections if r.needs_review
@@ -207,10 +378,9 @@ async def process_one(session: AsyncSession) -> UUID | None:
                 rejections=hard_rejections,
             )
 
-        # Combine extractor-emitted uncertainties (Gemini's
-        # ``uncertain[]`` + the confidence-floor demotions in
-        # extractor.py) with validator soft-rejects.
-        uncertainty_items: list[dict[str, Any]] = list(result.uncertain) + needs_review_uncertainties
+        uncertainty_items: list[dict[str, Any]] = (
+            list(result.uncertain) + needs_review_uncertainties
+        )
         uncertainties_written = 0
         if uncertainty_items:
             uncertainties_written = await apply_uncertainties(
@@ -227,7 +397,6 @@ async def process_one(session: AsyncSession) -> UUID | None:
             plan=validated_plan,
         )
 
-        # Always drop a summary onto the activity section so the feed stays lively.
         if result.summary:
             await session.execute(
                 text(

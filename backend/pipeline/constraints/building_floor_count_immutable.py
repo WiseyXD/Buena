@@ -16,12 +16,22 @@ from backend.pipeline.validator import (
     ValidationResult,
     event_document_type,
     event_source,
+    event_stammdaten,
     register,
+    values_differ,
 )
 
 
 class BuildingFloorCountImmutable:
-    """Reject any non-structural-permit attempt to mutate floor count."""
+    """Reject any non-structural-permit attempt to mutate floor count.
+
+    Strict mode: when no prior fact exists, fall back to
+    ``buildings.metadata.etagen`` (loaded as ``stammdaten.building.
+    floor_count`` by the worker). A claim that contradicts the
+    stammdaten value is rejected even on the very first write — the
+    physical building doesn't grow new floors because a tenant emails
+    about ``7. Stockwerk``.
+    """
 
     name = "building_floor_count_immutable"
     section = "building_overview"
@@ -33,18 +43,34 @@ class BuildingFloorCountImmutable:
         current: dict[str, Any] | None,
         event: dict[str, Any],
     ) -> ValidationResult:
+        stammdaten_value = event_stammdaten(event, "building").get("floor_count")
+        is_permit_pdf = (
+            event_source(event) == "pdf"
+            and event_document_type(event) == "structural_permit"
+        )
+
         if current is None:
-            # No prior fact — likely the very first stammdaten load.
-            # Allow regardless of source so the seed path works.
+            if stammdaten_value is not None and values_differ(
+                proposed.value, stammdaten_value
+            ):
+                if is_permit_pdf:
+                    return ValidationResult.needs_review(
+                        "building floor count change vs stammdaten "
+                        f"(stammdaten={stammdaten_value}, "
+                        f"proposed={proposed.value}) with structural_permit; "
+                        "needs human confirmation",
+                        required_source_type="structural_permit",
+                    )
+                return ValidationResult.rejected(
+                    "building floor count contradicts stammdaten "
+                    f"({stammdaten_value} on file, event claims "
+                    f"{proposed.value}) — only a structural_permit PDF "
+                    "can revise a physical building property",
+                    required_source_type="structural_permit",
+                )
             return ValidationResult.passed("no prior fact, seeding")
 
-        # Identical writes are already short-circuited by the differ;
-        # if we got here the value is changing.
-        if event_source(event) == "pdf" and event_document_type(event) == "structural_permit":
-            # Genuine structural change with a permit attached. Still
-            # surface for human verification — floor changes are rare
-            # enough that "needs_review" is the right default even
-            # with the permit.
+        if is_permit_pdf:
             return ValidationResult.needs_review(
                 "building floor count change requested with structural_permit; "
                 "needs human confirmation",

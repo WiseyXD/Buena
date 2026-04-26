@@ -329,6 +329,47 @@ def event_source(event: dict[str, Any]) -> str:
     return str(event.get("source") or "").lower()
 
 
+def event_stammdaten(event: dict[str, Any], scope: str) -> dict[str, Any]:
+    """Return the stammdaten snapshot for ``scope`` (``building`` / ``property``).
+
+    The worker pre-loads ``buildings.metadata`` + ``properties.metadata`` and
+    attaches them to the event dict before calling :func:`validate` so
+    constraints can compare proposed values against the master record
+    without each one re-running its own SQL. Returns ``{}`` when nothing
+    was loaded — constraints must treat that as "no ground truth, fall
+    through to default behaviour".
+    """
+    snap = event.get("stammdaten") or {}
+    if not isinstance(snap, dict):
+        return {}
+    bucket = snap.get(scope) or {}
+    return bucket if isinstance(bucket, dict) else {}
+
+
+def _normalise(value: object) -> str:
+    """Cheap canonicalisation for strict-equality compares against stammdaten."""
+    if value is None:
+        return ""
+    s = str(value).strip().lower()
+    # Drop trailing zero / decimal noise so "5", "5.0", "5,00" all match.
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+def values_differ(proposed: object, stammdaten_value: object) -> bool:
+    """Return ``True`` when a proposed value contradicts the stammdaten record.
+
+    Used by every immutable-field constraint when checking strict mode
+    (``current is None``). Comparisons normalise whitespace, casing, and
+    trivial numeric formatting differences — anything else counts as a
+    real contradiction worth rejecting.
+    """
+    if stammdaten_value in (None, ""):
+        return False
+    return _normalise(proposed) != _normalise(stammdaten_value)
+
+
 __all__ = [
     "Constraint",
     "REGISTRY",
@@ -339,7 +380,9 @@ __all__ = [
     "constraints_for",
     "event_document_type",
     "event_source",
+    "event_stammdaten",
     "persist_rejections",
     "register",
     "validate",
+    "values_differ",
 ]

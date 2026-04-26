@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.session import get_session
 from backend.pipeline.events import insert_event
-from backend.pipeline.worker import process_batch
+from backend.pipeline.worker import process_specific
 
 router = APIRouter(prefix="/debug", tags=["debug"])
 log = structlog.get_logger(__name__)
@@ -59,7 +59,12 @@ async def trigger_event(
     payload: TriggerEventRequest,
     session: AsyncSession = Depends(get_session),
 ) -> TriggerEventResponse:
-    """Insert an event synchronously and kick the worker once."""
+    """Insert an event synchronously and process it end-to-end immediately.
+
+    Bypasses the FIFO queue so the demo trigger lands its fact even
+    when the worker has hundreds of older Buena events still pending
+    (the queue clears in the background as the regular worker drains).
+    """
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body must not be empty")
 
@@ -73,8 +78,7 @@ async def trigger_event(
     )
     await session.commit()
 
-    # Process immediately so `curl` sees updated markdown inside the same call.
-    processed = await process_batch(max_events=5)
+    processed = 1 if await process_specific(event_id) else 0
 
     log.info(
         "debug.trigger_event",
