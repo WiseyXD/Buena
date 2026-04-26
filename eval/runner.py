@@ -37,20 +37,25 @@ from decimal import Decimal
 
 from backend.db.session import get_sessionmaker
 from backend.logging import configure_logging
+from backend.pipeline import extractor as extractor_module
 from backend.pipeline.extractor import extract as run_extractor
 from backend.pipeline.router import (
     route_structured,
     route_text_event,
 )
+from backend.services import pioneer_llm
+from backend.services.gemini import GeminiUnavailable
 from connectors import cost_ledger
 from connectors.cost_ledger import CostCapExceeded
 from connectors.migrations import apply_all as ensure_migrations
 from eval.metrics import Report, score_row
 
-# Eval-run ledger label. The cap is generous because evals are run
+# Eval-run ledger labels. The cap is generous because evals are run
 # infrequently and we'd rather see the spend than hit the limit
-# mid-run; the cap exists mainly to stop runaway loops.
-EVAL_LEDGER_LABEL = "step5_eval"
+# mid-run; the cap exists mainly to stop runaway loops. Pioneer gets
+# its own label so historical Gemini spend isn't mixed in.
+EVAL_LEDGER_LABEL_GEMINI = "step5_eval"
+EVAL_LEDGER_LABEL_PIONEER = "step5_eval_pioneer"
 EVAL_LEDGER_CAP_USD = Decimal("5.00")
 
 # Gemini 2.5 Pro public pricing as of 2026-04-25 (USD per 1M tokens).
@@ -156,6 +161,41 @@ def _gemini_call_cost(model: str, prompt_tokens: int, completion_tokens: int) ->
     return cost.quantize(Decimal("0.000001"))
 
 
+async def _pioneer_as_gemini(**kwargs: Any) -> Any:
+    """Adapter so the production extractor wrapper can call Pioneer transparently.
+
+    The wrapper in ``backend.pipeline.extractor.extract`` catches
+    :class:`GeminiUnavailable` and falls back to the rule-based path —
+    we want the same behavior on Pioneer transport failures so the
+    eval row still gets scored (with ``extractor.source="rule"``)
+    instead of crashing the whole run mid-set.
+    """
+    try:
+        return await pioneer_llm.extract_facts(**kwargs)
+    except pioneer_llm.PioneerUnavailable as exc:
+        raise GeminiUnavailable(str(exc)) from exc
+
+
+def _install_pioneer_backend() -> None:
+    """Swap the LLM backend the production extractor calls.
+
+    The wrapper imported ``gemini_extract`` and ``gemini_available`` as
+    module-level names; reassigning those names on
+    ``backend.pipeline.extractor`` flips the backend for this process
+    only. Production code paths are untouched.
+    """
+    extractor_module.gemini_extract = _pioneer_as_gemini  # type: ignore[assignment]
+    extractor_module.gemini_available = pioneer_llm.is_available  # type: ignore[assignment]
+    log.info("eval.backend.installed", backend="pioneer")
+
+
+# Mutated by ``main()`` based on ``--via``. Read by ``_score_one`` to
+# pick the right cost-ledger label and decide which token-cost formula
+# applies (or skip the ledger entirely for Pioneer).
+ACTIVE_BACKEND: str = "gemini"
+ACTIVE_LEDGER_LABEL: str = EVAL_LEDGER_LABEL_GEMINI
+
+
 async def _score_one(row: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     """Run the extractor + router on one ground-truth row.
 
@@ -189,19 +229,24 @@ async def _score_one(row: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     prompt_tokens = getattr(result, "prompt_tokens", None)
     completion_tokens = getattr(result, "completion_tokens", None)
     model = getattr(result, "model", "") or ""
+    extractor_source = getattr(result, "source", "")
     if (
-        getattr(result, "source", "") == "gemini"
+        extractor_source == "gemini"
         and prompt_tokens is not None
         and completion_tokens is not None
     ):
         try:
             cost = _gemini_call_cost(model, int(prompt_tokens), int(completion_tokens))
-            cost_ledger.charge(EVAL_LEDGER_LABEL, cost)
+            cost_ledger.charge(ACTIVE_LEDGER_LABEL, cost)
         except CostCapExceeded:
             log.warning("eval.cost_cap_hit", event_id=event_id)
             raise
         except Exception as exc:  # noqa: BLE001
             log.warning("eval.ledger_error", error=str(exc))
+    elif extractor_source == "pioneer":
+        # Pioneer keys are sponsor-supplied for the hackathon; no ledger charge.
+        # Tokens are still surfaced in scored row metadata for reporting.
+        pass
 
     scored = score_row(
         event_id=event_id,
@@ -239,7 +284,7 @@ async def run(set_name: str) -> tuple[Report, list[dict[str, Any]]]:
     # eval-runner cap is generous because a 30-row pass at Pro pricing
     # is on the order of a few cents.
     try:
-        cost_ledger.ensure_label(EVAL_LEDGER_LABEL, EVAL_LEDGER_CAP_USD)
+        cost_ledger.ensure_label(ACTIVE_LEDGER_LABEL, EVAL_LEDGER_CAP_USD)
     except Exception as exc:  # noqa: BLE001
         log.warning("eval.cost_ledger_unavailable", error=str(exc))
 
@@ -251,10 +296,11 @@ async def run(set_name: str) -> tuple[Report, list[dict[str, Any]]]:
         raw.append(payload)
 
     try:
-        state = cost_ledger.get_state(EVAL_LEDGER_LABEL)
+        state = cost_ledger.get_state(ACTIVE_LEDGER_LABEL)
         if state is not None:
             log.info(
                 "eval.cost_ledger.summary",
+                label=ACTIVE_LEDGER_LABEL,
                 cumulative_usd=str(state.cumulative_usd),
                 cap_usd=str(state.cap_usd),
             )
@@ -276,6 +322,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional markdown destination (e.g. eval/runs/2026-04-25-step4.md).",
     )
+    p.add_argument(
+        "--via",
+        choices=["gemini", "pioneer"],
+        default="gemini",
+        help=(
+            "LLM backend the production extractor wrapper calls. 'pioneer' "
+            "monkey-patches backend.pipeline.extractor for this run only and "
+            "writes to the step5_eval_pioneer ledger label. Production code "
+            "paths are untouched."
+        ),
+    )
     return p
 
 
@@ -283,6 +340,13 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point — returns a POSIX exit code."""
     configure_logging()
     args = _build_parser().parse_args(argv)
+    global ACTIVE_BACKEND, ACTIVE_LEDGER_LABEL
+    ACTIVE_BACKEND = args.via
+    ACTIVE_LEDGER_LABEL = (
+        EVAL_LEDGER_LABEL_PIONEER if args.via == "pioneer" else EVAL_LEDGER_LABEL_GEMINI
+    )
+    if args.via == "pioneer":
+        _install_pioneer_backend()
     try:
         report, raw_payloads = asyncio.run(run(args.set))
     except FileNotFoundError as exc:
@@ -303,8 +367,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, indent=2, default=str))
     else:
         markdown = report.render_markdown()
+        markdown = (
+            f"_Backend: **{ACTIVE_BACKEND}**_\n\n" + markdown
+        )
         try:
-            state = cost_ledger.get_state(EVAL_LEDGER_LABEL)
+            state = cost_ledger.get_state(ACTIVE_LEDGER_LABEL)
         except Exception:  # noqa: BLE001
             state = None
         if state is not None:

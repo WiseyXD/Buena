@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.session import get_session
 from backend.pipeline.renderer import render_markdown
+from backend.services import ask as ask_service
+from backend.services import pioneer_llm
 from backend.services.tavily import enrich_property
 
 router = APIRouter(prefix="/properties", tags=["properties"])
@@ -21,13 +23,24 @@ log = structlog.get_logger(__name__)
 
 
 class PropertySummary(BaseModel):
-    """Compact property record used by the portfolio listing."""
+    """Compact property record used by the portfolio listing.
+
+    Counts are computed at query time from indexed property_id lookups on
+    ``events``, ``facts`` (current only — ``superseded_by IS NULL``),
+    ``uncertainty_events`` (``status='open'``), and ``signals``
+    (``status='pending'``). At Buena's 56-property scale this is ~224
+    index hits per request — single-digit ms total.
+    """
 
     id: UUID
     name: str
     address: str
     owner_name: str | None = None
     building_year_built: int | None = None
+    events: int = 0
+    facts: int = 0
+    needs_review: int = 0
+    open_issues: int = 0
 
 
 class PropertyCreateRequest(BaseModel):
@@ -67,6 +80,43 @@ class PropertySearchHit(BaseModel):
     score: float
 
 
+class PropertyFileFact(BaseModel):
+    """One row in a property file section, shaped for the frontend.
+
+    Mirrors the UI's ``Fact`` type (``value`` / ``source`` / ``date``) and
+    surfaces ``section`` / ``field`` / ``event_id`` so the renderer can
+    deep-link to the originating event when the user clicks ``[source]``.
+    """
+
+    value: str
+    source: str
+    date: str
+    confidence: float | None = None
+    urgent: bool = False
+    reason: str | None = None
+    section: str
+    field: str
+    event_id: str | None = None
+
+
+class PropertyFileSection(BaseModel):
+    """Display section grouping facts under a single heading."""
+
+    title: str
+    facts: list[PropertyFileFact]
+    is_uncertain: bool = False
+    is_context: bool = False
+
+
+class PropertyFile(BaseModel):
+    """Structured payload powering the PropertyDetail page."""
+
+    id: UUID
+    name: str
+    address: str
+    sections: list[PropertyFileSection]
+
+
 class GraphNode(BaseModel):
     """A node in the property context graph."""
 
@@ -102,7 +152,18 @@ async def list_properties(
             """
             SELECT p.id, p.name, p.address,
                    o.name AS owner_name,
-                   b.year_built AS building_year_built
+                   b.year_built AS building_year_built,
+                   (SELECT COUNT(*) FROM events
+                      WHERE property_id = p.id) AS events,
+                   (SELECT COUNT(*) FROM facts
+                      WHERE property_id = p.id
+                        AND superseded_by IS NULL) AS facts,
+                   (SELECT COUNT(*) FROM uncertainty_events
+                      WHERE property_id = p.id
+                        AND status = 'open') AS needs_review,
+                   (SELECT COUNT(*) FROM signals
+                      WHERE property_id = p.id
+                        AND status = 'pending') AS open_issues
             FROM properties p
             LEFT JOIN owners o ON o.id = p.owner_id
             LEFT JOIN buildings b ON b.id = p.building_id
@@ -117,6 +178,10 @@ async def list_properties(
             address=row.address,
             owner_name=row.owner_name,
             building_year_built=row.building_year_built,
+            events=int(row.events or 0),
+            facts=int(row.facts or 0),
+            needs_review=int(row.needs_review or 0),
+            open_issues=int(row.open_issues or 0),
         )
         for row in result.all()
     ]
@@ -446,6 +511,197 @@ async def property_markdown(
     return PlainTextResponse(content=body, media_type="text/markdown; charset=utf-8")
 
 
+# Display labels per backend section enum. Keep in sync with the
+# section names in ``backend.services.gemini.EXTRACTION_SCHEMA``.
+_SECTION_LABELS: dict[str, str] = {
+    "overview": "Overview",
+    "tenants": "Tenants",
+    "lease": "Lease",
+    "maintenance": "Maintenance",
+    "financials": "Financials",
+    "compliance": "Compliance",
+    "activity": "Activity",
+    "patterns": "Patterns",
+    "building_financials": "Building Context",
+    "building_maintenance": "Building Context",
+    "building_compliance": "Building Context",
+    "liegenschaft_financials": "WEG Context",
+    "liegenschaft_maintenance": "WEG Context",
+    "liegenschaft_compliance": "WEG Context",
+}
+
+# Sections that display under a "Context" heading rather than as a
+# primary fact section — the frontend uses the ``isContext`` flag to
+# render these with a quieter visual treatment.
+_CONTEXT_SECTIONS: frozenset[str] = frozenset(
+    {
+        "building_financials",
+        "building_maintenance",
+        "building_compliance",
+        "liegenschaft_financials",
+        "liegenschaft_maintenance",
+        "liegenschaft_compliance",
+    }
+)
+
+# Sources whose presence implies a fact came from an authoritative
+# document rather than an email — surfaced verbatim in the UI's "via"
+# label so PDFs read as "Mietvertrag.pdf" instead of just "letter".
+_AUTHORITATIVE_DOCUMENT_TYPES: frozenset[str] = frozenset(
+    {"lease", "lease_addendum", "kaufvertrag", "structural_permit", "vermessungsprotokoll"}
+)
+
+
+@router.get("/{property_id}/file", response_model=PropertyFile)
+async def property_file(
+    property_id: UUID,
+    session: AsyncSession = Depends(get_session),
+) -> PropertyFile:
+    """Return the structured property file — sections + facts + uncertainties.
+
+    The frontend's ``PropertyDetail`` page renders one section per group
+    with a ``[source]`` button on each fact that opens the originating
+    event. Open ``uncertainty_events`` are appended as a ``Needs Review``
+    section so the user sees gaps explicitly rather than silently.
+    """
+    meta_row = (
+        await session.execute(
+            text(
+                """
+                SELECT id, name, address
+                FROM properties
+                WHERE id = :pid
+                """
+            ),
+            {"pid": property_id},
+        )
+    ).first()
+    if meta_row is None:
+        raise HTTPException(status_code=404, detail="property not found")
+
+    fact_rows = (
+        await session.execute(
+            text(
+                """
+                SELECT f.section, f.field, f.value, f.confidence,
+                       f.created_at,
+                       e.source AS event_source,
+                       e.received_at AS event_received_at,
+                       e.metadata->>'document_type' AS document_type,
+                       f.source_event_id
+                FROM facts f
+                LEFT JOIN events e ON e.id = f.source_event_id
+                WHERE f.property_id = :pid
+                  AND f.superseded_by IS NULL
+                ORDER BY f.section ASC, f.created_at DESC
+                """
+            ),
+            {"pid": property_id},
+        )
+    ).all()
+
+    uncertainty_rows = (
+        await session.execute(
+            text(
+                """
+                SELECT observation, hypothesis, reason_uncertain,
+                       relevant_section, created_at
+                FROM uncertainty_events
+                WHERE property_id = :pid
+                  AND status = 'open'
+                ORDER BY created_at DESC
+                """
+            ),
+            {"pid": property_id},
+        )
+    ).all()
+
+    grouped: dict[str, list[PropertyFileFact]] = {}
+    title_order: list[str] = []
+    context_titles: set[str] = set()
+
+    for row in fact_rows:
+        title = _SECTION_LABELS.get(row.section, row.section.replace("_", " ").title())
+        if title not in grouped:
+            grouped[title] = []
+            title_order.append(title)
+        if row.section in _CONTEXT_SECTIONS:
+            context_titles.add(title)
+
+        # Prefer the document type for source labels (so PDFs show as
+        # ``Mietvertrag`` rather than ``letter``); fall back to the raw
+        # event source; ``stammdaten`` for facts that were never linked
+        # to an event (master-data load).
+        doc_type = (row.document_type or "").strip()
+        if doc_type and doc_type in _AUTHORITATIVE_DOCUMENT_TYPES:
+            source_label = doc_type
+        elif row.event_source:
+            source_label = row.event_source
+        else:
+            source_label = "stammdaten"
+
+        when = row.event_received_at or row.created_at
+        grouped[title].append(
+            PropertyFileFact(
+                value=row.value,
+                source=source_label,
+                date=when.date().isoformat(),
+                confidence=(
+                    float(row.confidence) if row.confidence is not None else None
+                ),
+                section=row.section,
+                field=row.field,
+                event_id=str(row.source_event_id) if row.source_event_id else None,
+            )
+        )
+
+    sections: list[PropertyFileSection] = [
+        PropertyFileSection(
+            title=title,
+            facts=grouped[title],
+            is_context=title in context_titles,
+        )
+        for title in title_order
+    ]
+
+    if uncertainty_rows:
+        review_facts: list[PropertyFileFact] = []
+        for u in uncertainty_rows:
+            value = u.observation
+            if u.hypothesis:
+                value = f"{u.observation} — {u.hypothesis}"
+            review_facts.append(
+                PropertyFileFact(
+                    value=value,
+                    source="extractor",
+                    date=u.created_at.date().isoformat(),
+                    reason=u.reason_uncertain,
+                    section=u.relevant_section or "",
+                    field="",
+                )
+            )
+        sections.append(
+            PropertyFileSection(
+                title="Needs Review (Zu prüfen)",
+                facts=review_facts,
+                is_uncertain=True,
+            )
+        )
+
+    log.info(
+        "properties.file.render",
+        property_id=str(property_id),
+        sections=len(sections),
+        facts=sum(len(s.facts) for s in sections),
+    )
+    return PropertyFile(
+        id=meta_row.id,
+        name=meta_row.name,
+        address=meta_row.address,
+        sections=sections,
+    )
+
+
 class ActivityItem(BaseModel):
     """Activity feed row — a processed event + its one-line summary."""
 
@@ -496,3 +752,181 @@ async def property_activity(
     ]
     log.info("properties.activity", property_id=str(property_id), count=len(items))
     return items
+
+
+# -----------------------------------------------------------------------------
+# Phase 11 — property-scoped Q&A
+# -----------------------------------------------------------------------------
+
+
+class AskRequest(BaseModel):
+    """Payload for ``POST /properties/{id}/ask``."""
+
+    question: str = Field(..., min_length=1, max_length=600)
+
+
+class AskSourceItem(BaseModel):
+    """Source citation used by both ``answered`` and ``insufficient_context``."""
+
+    id: str
+    channel: str
+    date: str
+    snippet: str
+
+
+class AskResponse(BaseModel):
+    """Q&A response with three status branches the frontend renders distinctly.
+
+    Phase 9 trust-layer rule: an honest "I don't know" beats a confident
+    hallucination. The ``insufficient_context`` and ``out_of_scope``
+    branches keep ``answer`` ``None`` and surface the partial-context
+    or out-of-scope reasoning explicitly.
+    """
+
+    status: str  # 'answered' | 'insufficient_context' | 'out_of_scope'
+    answer: str | None
+    confidence: str
+    reasoning: str = ""
+    sources: list[AskSourceItem] = Field(default_factory=list)
+    partial_context: list[AskSourceItem] = Field(default_factory=list)
+    elapsed_ms: float
+    retrieved_count: int
+    model: str
+
+
+async def _fetch_ask_context(
+    session: AsyncSession, property_id: UUID
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, str]],
+]:
+    """Pull facts + events + a lookup table that maps event_id → citation shape."""
+    fact_rows = (
+        await session.execute(
+            text(
+                """
+                SELECT f.section, f.field, f.value,
+                       COALESCE(f.created_at, now()) AS dt
+                FROM facts f
+                WHERE f.property_id = :pid
+                  AND f.superseded_by IS NULL
+                ORDER BY f.created_at DESC
+                LIMIT 30
+                """
+            ),
+            {"pid": property_id},
+        )
+    ).all()
+    facts = [
+        {
+            "section": str(r.section),
+            "field": str(r.field),
+            "value": str(r.value),
+            "date": r.dt.date().isoformat(),
+        }
+        for r in fact_rows
+    ]
+
+    event_rows = (
+        await session.execute(
+            text(
+                """
+                SELECT e.id, e.source,
+                       COALESCE(e.received_at, e.processed_at, now()) AS rec,
+                       LEFT(COALESCE(e.raw_content, ''), 320) AS snippet
+                FROM events e
+                WHERE e.property_id = :pid
+                  AND COALESCE(e.received_at, e.processed_at) > now() - interval '90 days'
+                ORDER BY rec DESC
+                LIMIT 12
+                """
+            ),
+            {"pid": property_id},
+        )
+    ).all()
+    events: list[dict[str, Any]] = []
+    citation_lookup: dict[str, dict[str, str]] = {}
+    for r in event_rows:
+        eid = str(r.id)
+        snippet = str(r.snippet or "").replace("\n", " ").strip()
+        events.append(
+            {
+                "id": eid,
+                "source": str(r.source),
+                "received_at": r.rec.isoformat() if r.rec else "",
+                "snippet": snippet,
+            }
+        )
+        citation_lookup[eid] = {
+            "id": eid,
+            "channel": str(r.source),
+            "date": r.rec.date().isoformat() if r.rec else "",
+            "snippet": snippet[:240],
+        }
+    return facts, events, citation_lookup
+
+
+@router.post("/{property_id}/ask", response_model=AskResponse)
+async def property_ask(
+    property_id: UUID,
+    payload: AskRequest,
+    session: AsyncSession = Depends(get_session),
+) -> AskResponse:
+    """Answer a question scoped to one property's facts + recent events."""
+    meta_row = (
+        await session.execute(
+            text("SELECT name FROM properties WHERE id = :pid"),
+            {"pid": property_id},
+        )
+    ).first()
+    if meta_row is None:
+        raise HTTPException(status_code=404, detail="property not found")
+
+    facts, events, citation_lookup = await _fetch_ask_context(session, property_id)
+
+    try:
+        result = await ask_service.answer_question(
+            property_name=str(meta_row.name),
+            question=payload.question,
+            recent_facts=facts,
+            recent_events=events,
+        )
+    except pioneer_llm.PioneerUnavailable as exc:
+        log.warning("properties.ask.unavailable", error=str(exc))
+        raise HTTPException(
+            status_code=503,
+            detail=f"ask service unavailable: {exc}",
+        ) from exc
+
+    sources: list[AskSourceItem] = []
+    partial_context: list[AskSourceItem] = []
+    for eid in result["cited_event_ids"]:
+        cite = citation_lookup.get(eid)
+        if cite is not None:
+            sources.append(AskSourceItem(**cite))
+    for eid in result["partial_context_event_ids"]:
+        cite = citation_lookup.get(eid)
+        if cite is not None:
+            partial_context.append(AskSourceItem(**cite))
+
+    log.info(
+        "properties.ask.respond",
+        property_id=str(property_id),
+        status=result["status"],
+        sources=len(sources),
+        partial=len(partial_context),
+        retrieved=len(events),
+    )
+
+    return AskResponse(
+        status=result["status"],
+        answer=result["answer"],
+        confidence=result["confidence"],
+        reasoning=result["reasoning"],
+        sources=sources,
+        partial_context=partial_context,
+        elapsed_ms=float(result["latency_ms"]),
+        retrieved_count=len(events),
+        model=str(result["model"]),
+    )

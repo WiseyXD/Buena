@@ -13,6 +13,7 @@ this time.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 from decimal import Decimal
@@ -23,8 +24,9 @@ import psycopg2
 import structlog
 
 from backend.config import get_settings
-from backend.services.gemini import extract_facts
+from backend.services.gemini import extract_facts as gemini_extract
 from backend.services.lang import detect_language
+from backend.services.pioneer_llm import extract_facts as pioneer_extract
 from connectors import cost_ledger
 
 log = structlog.get_logger(__name__)
@@ -87,7 +89,7 @@ def _fetch_canonical_event() -> dict[str, Any]:
     }
 
 
-async def _amain() -> None:
+async def _amain(via: str) -> None:
     cost_ledger.ensure_label(LEDGER_LABEL, LEDGER_CAP_USD)
     state_before = cost_ledger.get_state(LEDGER_LABEL)
 
@@ -109,18 +111,19 @@ async def _amain() -> None:
     print()
 
     print("=" * 72)
-    print("RE-EXTRACT — single Pro call, no internal retry, no rule fallback")
+    print(f"RE-EXTRACT — single {via} call, no internal retry, no rule fallback")
     print("=" * 72)
     # Bypass the wrapper in backend.pipeline.extractor so:
     #   - max_attempts=1 → exactly one HTTP call per script invocation
     #     (the user's spec is human-paced retries between invocations).
-    #   - GeminiUnavailable (after the 1 attempt) propagates instead of
-    #     silently falling through to the rule-based path, which has
-    #     nothing to do with the JSON vocabulary and would make a 429
-    #     look like a vocab regression.
+    #   - The model-specific Unavailable error (after the 1 attempt)
+    #     propagates instead of silently falling through to the
+    #     rule-based path, which has nothing to do with the JSON
+    #     vocabulary and would make a 429 look like a vocab regression.
     raw = event["raw_content"]
     lang = detect_language(raw)
-    result = await extract_facts(
+    extract = pioneer_extract if via == "pioneer" else gemini_extract
+    result = await extract(
         property_name="Immanuelkirchstraße 26 WE 29",
         current_context_excerpt="(none — vocab-fix verification run)",
         source="email",
@@ -140,8 +143,15 @@ async def _amain() -> None:
         print(f"completion_tokens  : {result.completion_tokens}")
         print(f"latency_ms         : {result.latency_ms:.0f}")
         print(f"call cost (USD)    : ${cost:.6f}")
+    elif result.source == "pioneer":
+        # Pioneer keys are sponsor-supplied for the hackathon; no Gemini-ledger charge.
+        print(f"extractor source   : pioneer ({result.model})")
+        print(f"prompt_tokens      : {result.prompt_tokens}")
+        print(f"completion_tokens  : {result.completion_tokens}")
+        print(f"latency_ms         : {result.latency_ms:.0f}")
+        print("call cost (USD)    : (not charged — Pioneer hackathon credits)")
     else:
-        print(f"extractor source   : {result.source}  (rule-based, no Gemini call)")
+        print(f"extractor source   : {result.source}  (rule-based, no LLM call)")
 
     print()
     print(f"category           : {result.category}")
@@ -162,17 +172,17 @@ async def _amain() -> None:
     print(f"fields picked      : {fields_picked}")
     if "noise_complaint" in fields_picked:
         print(
-            "OUTCOME            : ✓ vocab fix shifted Gemini to noise_complaint — "
+            f"OUTCOME            : ✓ vocab fix shifted {result.source} to noise_complaint — "
             "proceed to Step 2"
         )
     elif "open_water_damage" in fields_picked:
         print(
-            "OUTCOME            : ✗ Gemini still picked open_water_damage despite the "
-            "noise_complaint field being available — needs anti_examples escalation"
+            f"OUTCOME            : ✗ {result.source} still picked open_water_damage despite "
+            "the noise_complaint field being available — needs anti_examples escalation"
         )
     else:
         print(
-            f"OUTCOME            : ? Gemini picked something else: {fields_picked} — "
+            f"OUTCOME            : ? {result.source} picked something else: {fields_picked} — "
             "examine before deciding next step"
         )
     print()
@@ -190,5 +200,22 @@ async def _amain() -> None:
     print("(facts NOT written to DB — Step 2 sweeps the corpus.)")
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--via",
+        choices=["gemini", "pioneer"],
+        default="gemini",
+        help=(
+            "Which LLM gateway to call. 'pioneer' routes through the "
+            "Pioneer OpenAI-compatible endpoint at Claude (PIONEER_API_KEY "
+            "required); 'gemini' uses the production Gemini Pro path. "
+            "Pioneer does NOT charge the phase11_vocab_verify cost ledger."
+        ),
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    asyncio.run(_amain())
+    args = _parse_args()
+    asyncio.run(_amain(via=args.via))

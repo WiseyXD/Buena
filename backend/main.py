@@ -19,6 +19,7 @@ from backend.api.buildings import (
     building_router as buildings_router,
     liegenschaft_router as liegenschaften_router,
 )
+from backend.api.draft_reply import router as draft_reply_router
 from backend.api.events import router as events_router
 from backend.api.files import router as files_router
 from backend.api.portfolio import router as portfolio_router
@@ -57,6 +58,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_cors_origins = [
+    origin.strip()
+    for origin in get_settings().keystone_cors_origins.split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(properties_router)
 app.include_router(buildings_router)
 app.include_router(liegenschaften_router)
@@ -70,6 +84,7 @@ app.include_router(signals_router)
 app.include_router(portfolio_router)
 app.include_router(settings_router)
 app.include_router(admin_router)
+app.include_router(draft_reply_router)
 
 
 @app.get("/health", tags=["system"])

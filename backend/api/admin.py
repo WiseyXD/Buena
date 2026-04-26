@@ -253,6 +253,39 @@ class RejectedUpdatesResponse(BaseModel):
     rows: list[RejectedUpdate]
 
 
+class InboxRejectedItem(BaseModel):
+    """Cross-property rejected-updates row for the global Inbox surface."""
+
+    rejection_id: UUID
+    event_id: UUID
+    property_id: UUID | None = None
+    property_name: str | None = None
+    proposed_section: str
+    proposed_field: str
+    proposed_value: str
+    constraint_name: str
+    reason: str
+    reviewed_status: str
+    created_at: datetime
+    snippet: str = ""
+
+
+class InboxUncertaintyItem(BaseModel):
+    """Cross-property uncertainty row for the global Inbox surface."""
+
+    uncertainty_id: UUID
+    event_id: UUID
+    property_id: UUID | None = None
+    property_name: str | None = None
+    relevant_section: str | None = None
+    observation: str
+    hypothesis: str | None = None
+    reason_uncertain: str
+    source: str
+    status: str
+    created_at: datetime
+
+
 class OverrideRequest(BaseModel):
     """Body for ``POST /rejected/{id}/override``."""
 
@@ -856,6 +889,142 @@ async def list_uncertainties_for_property(
         by_source=by_source,
         items=items,
     )
+
+
+# -----------------------------------------------------------------------------
+# Phase 11 — cross-property inboxes for the Inbox page
+# -----------------------------------------------------------------------------
+
+
+@router.get("/uncertainties", response_model=list[InboxUncertaintyItem])
+async def list_uncertainties_global(
+    status_filter: str = Query(
+        default="open",
+        alias="status",
+        pattern=r"^(open|resolved|dismissed|all)$",
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+) -> list[InboxUncertaintyItem]:
+    """Cross-property uncertainty inbox.
+
+    Same shape as ``GET /admin/properties/{id}/uncertainties`` minus the
+    by-section / by-source breakdowns, plus a ``property_name`` column
+    so the global Inbox can label each row.
+    """
+    where = ""
+    params: dict[str, Any] = {"lim": limit}
+    if status_filter != "all":
+        where = "WHERE u.status = :st"
+        params["st"] = status_filter
+
+    rows = (
+        await session.execute(
+            text(
+                f"""
+                SELECT u.id AS uncertainty_id,
+                       u.event_id,
+                       u.property_id,
+                       p.name AS property_name,
+                       u.relevant_section,
+                       u.observation, u.hypothesis, u.reason_uncertain,
+                       u.source, u.status, u.created_at
+                FROM uncertainty_events u
+                LEFT JOIN properties p ON p.id = u.property_id
+                {where}
+                ORDER BY u.created_at DESC
+                LIMIT :lim
+                """
+            ),
+            params,
+        )
+    ).all()
+
+    items = [
+        InboxUncertaintyItem(
+            uncertainty_id=r.uncertainty_id,
+            event_id=r.event_id,
+            property_id=r.property_id,
+            property_name=r.property_name,
+            relevant_section=r.relevant_section,
+            observation=str(r.observation or ""),
+            hypothesis=r.hypothesis,
+            reason_uncertain=str(r.reason_uncertain or ""),
+            source=str(r.source or "extractor"),
+            status=str(r.status),
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+    log.info(
+        "admin.uncertainties.global",
+        status=status_filter,
+        returned=len(items),
+    )
+    return items
+
+
+@router.get("/rejected", response_model=list[InboxRejectedItem])
+async def list_rejected_global(
+    status_filter: str | None = Query(
+        default="pending",
+        alias="status",
+    ),
+    limit: int = Query(default=50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+) -> list[InboxRejectedItem]:
+    """Cross-property rejected-updates inbox."""
+    params: dict[str, Any] = {"lim": limit}
+    where = ""
+    if status_filter:
+        where = "WHERE r.reviewed_status = :st"
+        params["st"] = status_filter
+
+    rows = (
+        await session.execute(
+            text(
+                f"""
+                SELECT r.id AS rejection_id,
+                       r.event_id, r.property_id,
+                       p.name AS property_name,
+                       r.proposed_section, r.proposed_field, r.proposed_value,
+                       r.constraint_name, r.reason,
+                       r.reviewed_status, r.created_at,
+                       COALESCE(LEFT(e.raw_content, 160), '') AS snippet
+                FROM rejected_updates r
+                LEFT JOIN events e ON e.id = r.event_id
+                LEFT JOIN properties p ON p.id = r.property_id
+                {where}
+                ORDER BY r.created_at DESC
+                LIMIT :lim
+                """
+            ),
+            params,
+        )
+    ).all()
+    items = [
+        InboxRejectedItem(
+            rejection_id=r.rejection_id,
+            event_id=r.event_id,
+            property_id=r.property_id,
+            property_name=r.property_name,
+            proposed_section=str(r.proposed_section),
+            proposed_field=str(r.proposed_field),
+            proposed_value=str(r.proposed_value),
+            constraint_name=str(r.constraint_name),
+            reason=str(r.reason),
+            reviewed_status=str(r.reviewed_status),
+            created_at=r.created_at,
+            snippet=str(r.snippet or ""),
+        )
+        for r in rows
+    ]
+    log.info(
+        "admin.rejected.global",
+        status=status_filter,
+        returned=len(items),
+    )
+    return items
 
 
 # -----------------------------------------------------------------------------
