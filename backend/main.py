@@ -28,7 +28,10 @@ from backend.api.properties import router as properties_router
 from backend.api.settings import router as settings_router
 from backend.api.signals import router as signals_router
 from backend.api.source_links import router as source_links_router
-from backend.api.sse import router as sse_router
+from backend.api.sse import (
+    portfolio_router as sse_portfolio_router,
+    router as sse_router,
+)
 from backend.api.uploads import router as uploads_router
 from backend.api.webhooks import router as webhooks_router
 from backend.config import get_settings
@@ -76,6 +79,7 @@ app.include_router(properties_router)
 app.include_router(buildings_router)
 app.include_router(liegenschaften_router)
 app.include_router(sse_router)
+app.include_router(sse_portfolio_router)
 app.include_router(events_router)
 app.include_router(source_links_router)
 app.include_router(files_router)

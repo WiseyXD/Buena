@@ -3,6 +3,10 @@
 ``GET /properties/{id}/events`` streams JSON envelopes whenever the worker
 finishes processing an event attached to that property. The browser / Lovable
 front-end re-fetches the markdown on each push.
+
+``GET /portfolio/events`` is the same stream with no property filter — the
+Layout subscribes to it once so a portfolio-wide toast can fire whenever
+any property's file gets a new fact.
 """
 
 from __future__ import annotations
@@ -19,14 +23,20 @@ from fastapi.responses import StreamingResponse
 from backend.pipeline.events import get_event_bus
 
 router = APIRouter(prefix="/properties", tags=["sse"])
+portfolio_router = APIRouter(prefix="/portfolio", tags=["sse"])
 log = structlog.get_logger(__name__)
 
 
-async def _event_stream(property_id: UUID) -> AsyncIterator[bytes]:
-    """Yield SSE-formatted lines for one subscriber."""
+async def _event_stream(property_id: UUID | None) -> AsyncIterator[bytes]:
+    """Yield SSE-formatted lines for one subscriber.
+
+    ``property_id=None`` subscribes to the global feed — the EventBus
+    fans every publish to ``None`` subscribers in addition to the
+    property-specific ones.
+    """
     bus = get_event_bus()
     queue = await bus.subscribe(property_id)
-    log.info("sse.subscribe", property_id=str(property_id))
+    log.info("sse.subscribe", property_id=str(property_id) if property_id else "*")
     try:
         # Initial hello so clients learn they're connected.
         yield b"event: hello\ndata: {}\n\n"
@@ -41,7 +51,9 @@ async def _event_stream(property_id: UUID) -> AsyncIterator[bytes]:
             yield b"event: fact_update\ndata: " + body + b"\n\n"
     finally:
         await bus.unsubscribe(property_id, queue)
-        log.info("sse.unsubscribe", property_id=str(property_id))
+        log.info(
+            "sse.unsubscribe", property_id=str(property_id) if property_id else "*"
+        )
 
 
 @router.get("/{property_id}/events")
@@ -52,3 +64,15 @@ async def property_events(property_id: UUID) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@portfolio_router.get("/events")
+async def portfolio_events() -> StreamingResponse:
+    """Portfolio-wide live stream — every fact update across all properties."""
+    return StreamingResponse(
+        _event_stream(None),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+

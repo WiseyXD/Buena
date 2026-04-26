@@ -94,6 +94,7 @@ class PropertyFileFact(BaseModel):
     value: str
     source: str
     date: str
+    date_iso: str | None = None
     confidence: float | None = None
     urgent: bool = False
     reason: str | None = None
@@ -662,6 +663,7 @@ async def property_file(
                 value=row.value,
                 source=source_label,
                 date=when.date().isoformat(),
+                date_iso=when.isoformat() if when else None,
                 confidence=(
                     float(row.confidence) if row.confidence is not None else None
                 ),
@@ -694,6 +696,7 @@ async def property_file(
                     value=value,
                     source="extractor",
                     date=u.created_at.date().isoformat(),
+                    date_iso=u.created_at.isoformat() if u.created_at else None,
                     reason=u.reason_uncertain,
                     section=u.relevant_section or "",
                     field="",
