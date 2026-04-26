@@ -67,6 +67,13 @@ _cors_origins = [
     for origin in get_settings().keystone_cors_origins.split(",")
     if origin.strip()
 ]
+
+# Always allow Lovable origins
+_cors_origins.extend([
+    "https://keystone-insight.lovable.app",
+    "https://preview--keystone-insight.lovable.app",
+])
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
